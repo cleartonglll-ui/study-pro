@@ -28,4 +28,9 @@ public interface AnswerService {
      * 学生提交答案到db
      */
     void submitAnswerByDB(AnswerDTO answerDTO);
+
+    /**
+     * 学生提交答案到db（仅做插入，一个学生插入多条回答记录）
+     */
+    void submitAnswerByDBMulti(AnswerDTO answerDTO);
 }

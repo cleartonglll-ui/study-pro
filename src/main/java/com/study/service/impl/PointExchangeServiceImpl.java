@@ -265,4 +265,25 @@ public class PointExchangeServiceImpl implements PointExchangeService {
             return false;
         }
     }
+
+    @Override
+    public int getPoints(Long userId) {
+        try {
+            // 查询用户积分记录
+            UserPoint userPoint = userPointMapper.selectOne(
+                    new LambdaQueryWrapper<UserPoint>().eq(UserPoint::getUserId, userId)
+            );
+
+            if (userPoint == null) {
+                // 如果用户积分记录不存在，返回0
+                return 0;
+            } else {
+                // 返回用户积分
+                return userPoint.getPoint();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return 0;
+        }
+    }
 }

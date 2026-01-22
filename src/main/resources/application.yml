@@ -2,73 +2,52 @@ spring:
   application:
     name: study-pro
 
-  # ShardingSphere 数据源配置
-  shardingsphere:
-    datasource:
-      names: master,slave
-      master:
-        type: com.zaxxer.hikari.HikariDataSource
-        jdbc-url: jdbc:mysql://192.168.150.101:3306/study_pro?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=UTC&connectTimeout=10000&socketTimeout=30000&allowPublicKeyRetrieval=true
-        username: root
-        password: 123
-        driver-class-name: com.mysql.cj.jdbc.Driver
-        connection-timeout: 20000
-        idle-timeout: 600000
-        max-lifetime: 1800000
-        maximum-pool-size: 20
-        minimum-idle: 10
-      slave:
-        type: com.zaxxer.hikari.HikariDataSource
-        jdbc-url: jdbc:mysql://192.169.150.4:3306/study_pro?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=UTC&connectTimeout=10000&socketTimeout=30000&allowPublicKeyRetrieval=true
-        username: root
-        password: mysql
-        driver-class-name: com.mysql.cj.jdbc.Driver
-        connection-timeout: 20000
-        idle-timeout: 600000
-        max-lifetime: 1800000
-        maximum-pool-size: 20
-        minimum-idle: 10
-    rules:
-      readwrite_splitting:
-        data_sources:
-          readwrite_ds:
-            type: Static
-            props:
-              write-data-source-name: master
-              read-data-source-names: slave
-              load-balancer-name: round_robin
-            load_balancers:
-              round_robin:
-                type: ROUND_ROBIN
-    props:
-      sql-show: true
-    mode:
-      type: Memory
-
-  # 默认数据源使用 ShardingSphere
+  # 数据源配置
   datasource:
-    driver-class-name: org.apache.shardingsphere.driver.ShardingSphereDriver
-    jdbc-url: jdbc:shardingsphere:memory:readwrite_ds
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    type: com.zaxxer.hikari.HikariDataSource
+    hikari:
+      minimum-idle: 10
+      maximum-pool-size: 100
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      validation-timeout: 5000
+      connection-test-query: SELECT 1
+    master:
+      url: jdbc:mysql://192.168.150.101:3306/study_pro?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=UTC
+      username: root
+      password: 123
+    slave:
+      url: jdbc:mysql://192.168.150.4:3306/study_pro?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=UTC
+      username: root
+      password: mysql
 
-  # Redis Configuration
+  # 数据库初始化配置
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:sql/init_schema.sql
+
+  # Redis 配置
   redis:
     host: localhost
     port: 6379
     timeout: 2000ms
     lettuce:
       pool:
-        max-active: 8
-        max-idle: 8
-        min-idle: 0
-        max-wait: -1ms
+        max-active: 100
+        max-idle: 50
+        min-idle: 10
+        max-wait: 1000ms
 
-  # Cache Configuration
+  # 缓存配置
   cache:
     type: redis
     redis:
       time-to-live: 3600000
 
-  # Async Configuration
+  # 异步配置
   task:
     execution:
       pool:
@@ -79,18 +58,42 @@ spring:
       pool:
         size: 5
 
-# Server Configuration
+# 服务器配置
 server:
   port: 8080
+  tomcat:
+    max-threads: 1000
+    min-spare-threads: 100
+    max-connections: 20000
+    accept-count: 10000
 
-# Logging Configuration
+# MyBatis Plus 配置
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# 日志配置
 logging:
   level:
-    com.study:
-      debug
-    org.springframework.data.redis:
-      info
-    org.redisson:
-      info
-    org.apache.shardingsphere:
-      info
+    root: info
+    com.study: info
+    com.study.controller: info
+    com.study.service.impl: info
+    org.springframework.data.redis: info
+    org.redisson: info
+    org.apache.shardingsphere: info
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: application.log
+    path: logs
+
+# 健康检查配置
+management:
+  health:
+    db:
+      enabled: false
+    probes:
+      enabled: true

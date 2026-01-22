@@ -4,7 +4,7 @@ import json
 import os
 
 # 基础URL配置
-BASE_URL_STAT_DB = "/api/answer/statistic-db/{}/{}"  # {} 分别是题目ID和plan ID
+BASE_URL_STAT_DB = "/answer/statistic-db/{}/{}"  # {} 分别是题目ID和plan ID
 
 # 配置参数
 QUESTION_COUNT = -1  # -1表示无限递增
@@ -128,7 +128,8 @@ def on_test_stop(environment, **kwargs):
     print("=" * 80)
 
 class TeacherQueryUser(FastHttpUser):
-    wait_time = between(0, 1)  # 任务间等待时间
+    wait_time = between(0, 1)  # 任务间等待时间，随机范围0-1秒
+    # wait_time = constant(1)  # 固定等待时间1秒
     host = "http://127.0.0.1:8080"  # 主机地址
     
     def __init__(self, parent, **kwargs):

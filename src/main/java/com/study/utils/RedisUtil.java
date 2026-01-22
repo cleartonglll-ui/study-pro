@@ -2,6 +2,7 @@ package com.study.utils;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
@@ -15,6 +16,9 @@ public class RedisUtil {
 
     @Autowired
     private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
     // ============================= String =============================
     public Boolean set(String key, Object value) {
@@ -67,6 +71,12 @@ public class RedisUtil {
 
     public Object hGet(String key, String hashKey) {
         return redisTemplate.opsForHash().get(key, hashKey);
+    }
+
+    // 专门用于获取字符串类型hash值的方法，使用StringRedisTemplate避免JSON解析问题
+    public String hGetString(String key, String hashKey) {
+        Object value = stringRedisTemplate.opsForHash().get(key, hashKey);
+        return value != null ? value.toString() : null;
     }
 
     public Map<Object, Object> hGetAll(String key) {
@@ -154,6 +164,14 @@ public class RedisUtil {
         redisScript.setScriptText(script);
         redisScript.setResultType((Class<List<Long>>) (Class<?>) List.class);
         return redisTemplate.execute(redisScript, keys, args);
+    }
+
+    // 专门用于执行返回字符串的Lua脚本的方法，使用StringRedisTemplate避免JSON解析问题
+    public String executeLuaScriptForStringResult(String script, List<String> keys, Object... args) {
+        DefaultRedisScript<String> redisScript = new DefaultRedisScript<>();
+        redisScript.setScriptText(script);
+        redisScript.setResultType(String.class);
+        return stringRedisTemplate.execute(redisScript, keys, args);
     }
 
     // ============================= 通用 =============================

@@ -33,4 +33,13 @@ public class PointExchangeController {
         boolean success = pointExchangeService.addPoints(request.getUserId(), request.getPoints());
         return success ? "添加积分成功" : "添加积分失败";
     }
+
+    /**
+     * 查询用户积分
+     */
+    @PostMapping("/query-point")
+    public String queryPoint(@Validated @RequestBody AddPointsRequest request) {
+        int points = pointExchangeService.getPoints(request.getUserId());
+        return "用户" + request.getUserId() + "的积分为：" + points;
+    }
 }

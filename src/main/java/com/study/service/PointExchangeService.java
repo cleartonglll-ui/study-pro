@@ -30,4 +30,11 @@ public interface PointExchangeService {
      * @return 是否成功
      */
     boolean addPoints(Long userId, Integer points);
+
+    /**
+     * 查询用户积分
+     * @param userId 用户ID
+     * @return 用户积分
+     */
+    int getPoints(Long userId);
 }

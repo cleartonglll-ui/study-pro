@@ -22,10 +22,22 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -39,77 +51,399 @@ public class AnswerServiceImpl implements AnswerService {
     @Autowired
     private AnswerMapper answerMapper;
 
-    private static final String ANSWER_KEY_PREFIX = "answer:";
-    private static final String ANSWER_STAT_KEY_PREFIX = "answer_stat:";
     private static final String STUDENT_ANSWER_KEY_PREFIX = "student_answer:";
 
-    private String loadLuaScript(String fileName) {
+    // 延迟队列，用于存储延迟检测任务
+    private final DelayQueue<DelayCheckTask> delayQueue = new DelayQueue<>();
+
+    // 线程池，用于执行延迟检测任务（优化线程池配置以应对高并发）
+    private final ExecutorService executorService = new ThreadPoolExecutor(
+            50, // 核心线程数
+            150, // 最大线程数
+            60L, // 线程存活时间
+            TimeUnit.SECONDS, // 时间单位
+            new LinkedBlockingQueue<>(5000), // 工作队列
+            new ThreadPoolExecutor.CallerRunsPolicy() // 拒绝策略
+    );
+
+    // 批量更新队列，用于收集待批量更新的答案
+    private final BlockingQueue<Answer> batchUpdateQueue = new LinkedBlockingQueue<>(20000);
+
+    // 批量更新阈值和间隔
+    private static final int BATCH_UPDATE_THRESHOLD = 20;
+    private static final long BATCH_UPDATE_INTERVAL = 5000; // 5秒
+
+    // 初始化批量更新线程
+    {
+        executorService.submit(() -> {
+            List<Answer> batchList = new ArrayList<>(BATCH_UPDATE_THRESHOLD);
+            long lastUpdateTime = System.currentTimeMillis();
+
+            log.info("批量更新线程已启动，阈值: {}, 间隔: {}ms", BATCH_UPDATE_THRESHOLD, BATCH_UPDATE_INTERVAL);
+
+            while (true) {
+                try {
+                    // 尝试从队列中获取答案
+                    Answer answer = batchUpdateQueue.poll(100, TimeUnit.MILLISECONDS);
+
+                    if (answer != null) {
+                        batchList.add(answer);
+                        // log.info("添加到批量更新队列，planId: {}, questionId: {}, studentId: {}, 当前批量大小: {}",
+                        //         answer.getPlanId(), answer.getQuestionId(), answer.getStudentId(), batchList.size());
+                    }
+
+                    // 检查是否达到批量更新条件
+                    long currentTime = System.currentTimeMillis();
+                    // log.info("检查批量更新条件 - 当前批量大小: {}, 时间差: {}ms, 队列大小: {}",
+                    //         batchList.size(), currentTime - lastUpdateTime, batchUpdateQueue.size());
+
+                    if (batchList.size() >= BATCH_UPDATE_THRESHOLD ||
+                        (batchList.size() > 0 && currentTime - lastUpdateTime >= BATCH_UPDATE_INTERVAL)) {
+
+                        if (!batchList.isEmpty()) {
+                            log.info("执行批量更新，更新条数: {}", batchList.size());
+                            // 执行批量更新
+                            batchUpdateAnswers(batchList);
+                            batchList.clear();
+                            lastUpdateTime = currentTime;
+                            log.info("批量更新完成");
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    log.error("批量更新线程被中断", e);
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    log.error("批量更新线程执行失败", e);
+                    // 重置状态，避免异常后批量更新停止
+                    batchList.clear();
+                    lastUpdateTime = System.currentTimeMillis();
+                }
+            }
+        });
+    }
+
+    // 初始化延迟队列处理线程
+    {
+        executorService.submit(() -> {
+            while (true) {
+                try {
+                    // 从延迟队列中获取到期的任务
+                    DelayCheckTask task = delayQueue.take();
+                    // 执行任务
+                    task.execute();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+    }
+
+    // 批量更新答案的方法
+    private void batchUpdateAnswers(List<Answer> answerList) {
+        if (answerList == null || answerList.isEmpty()) {
+            return;
+        }
+
         try {
-            ClassPathResource resource = new ClassPathResource("lua/" + fileName);
-            byte[] bytes = resource.getInputStream().readAllBytes();
-            return new String(bytes, StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to load Lua script: " + fileName, e);
+            log.info("开始批量更新，总条数: {}", answerList.size());
+
+            // 按planId+questionId+studentId分组，确保每个学生的每个问题只有一条最新记录
+            Map<String, Answer> uniqueAnswers = new HashMap<>();
+
+            for (Answer answer : answerList) {
+                String key = answer.getPlanId() + ":" + answer.getQuestionId() + ":" + answer.getStudentId();
+                // 只保留最新的记录
+                Answer existing = uniqueAnswers.get(key);
+                if (existing == null || answer.getUpdateTime().isAfter(existing.getUpdateTime())) {
+                    uniqueAnswers.put(key, answer);
+                }
+            }
+
+            // 执行批量更新/插入
+            List<Answer> uniqueList = new ArrayList<>(uniqueAnswers.values());
+            log.info("去重后条数: {}", uniqueList.size());
+
+            for (Answer answer : uniqueList) {
+                try {
+                    // 使用Redis分布式锁确保同一时间只有一个线程能够处理同一个学生的同一个问题的答案
+                    String lockKey = "lock:answer:" + answer.getPlanId() + ":" + answer.getQuestionId() + ":" + answer.getStudentId();
+                    boolean locked = false;
+                    try {
+                        // 尝试获取锁，过期时间10秒
+                        locked = redisUtil.setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS);
+                        if (locked) {
+                            // 检查数据库中是否已存在该学生的答题记录
+                            LambdaQueryWrapper<Answer> wrapper = new LambdaQueryWrapper<Answer>()
+                                    .eq(Answer::getPlanId, answer.getPlanId())
+                                    .eq(Answer::getQuestionId, answer.getQuestionId())
+                                    .eq(Answer::getStudentId, answer.getStudentId());
+
+                            Answer existingAnswer = answerMapper.selectOne(wrapper);
+                            if (existingAnswer != null) {
+                                // 已存在，更新记录
+                                existingAnswer.setAnswer(answer.getAnswer());
+                                existingAnswer.setUpdateTime(answer.getUpdateTime());
+                                int updateResult = answerMapper.updateById(existingAnswer);
+                                log.debug("更新答案成功，planId: {}, questionId: {}, studentId: {}, 影响行数: {}",
+                                        answer.getPlanId(), answer.getQuestionId(), answer.getStudentId(), updateResult);
+                            } else {
+                                // 不存在，创建新记录
+                                int insertResult = answerMapper.insert(answer);
+                                log.debug("插入答案成功，planId: {}, questionId: {}, studentId: {}, 影响行数: {}",
+                                        answer.getPlanId(), answer.getQuestionId(), answer.getStudentId(), insertResult);
+                            }
+                        } else {
+                            log.debug("获取锁失败，跳过处理，planId: {}, questionId: {}, studentId: {}",
+                                    answer.getPlanId(), answer.getQuestionId(), answer.getStudentId());
+                        }
+                    } finally {
+                        // 释放锁
+                        if (locked) {
+                            redisUtil.delete(lockKey);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.error("单个答案更新失败，planId: {}, questionId: {}, studentId: {}",
+                            answer.getPlanId(), answer.getQuestionId(), answer.getStudentId(), e);
+                }
+            }
+
+            log.info("批量更新完成");
+        } catch (Exception e) {
+            log.error("批量更新答案失败", e);
+        }
+    }
+
+    // 延迟检测任务类
+    private class DelayCheckTask implements Delayed {
+        private final long executeTime; // 执行时间
+        private final Integer planId;
+        private final Long questionId;
+        private final Long studentId;
+        private final String submittedAnswer;
+        private final String studentAnswerKey;
+
+        public DelayCheckTask(Integer planId, Long questionId, Long studentId, String submittedAnswer, String studentAnswerKey) {
+            // 随机延迟1-10秒
+            int randomDelay = (int) (Math.random() * 9000) + 10000; // 10000+毫秒
+            this.executeTime = System.currentTimeMillis() + randomDelay;
+            this.planId = planId;
+            this.questionId = questionId;
+            this.studentId = studentId;
+            this.submittedAnswer = submittedAnswer;
+            this.studentAnswerKey = studentAnswerKey;
+        }
+
+        @Override
+        public long getDelay(TimeUnit unit) {
+            long remaining = executeTime - System.currentTimeMillis();
+            return unit.convert(remaining, TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public int compareTo(Delayed other) {
+            return Long.compare(this.executeTime, ((DelayCheckTask) other).executeTime);
+        }
+
+        public void execute() {
+            try {
+                // 检测Redis中的最新答案
+                log.info("延迟检测任务执行，键: {}, 学生ID: {}", studentAnswerKey, studentId);
+                String latestAnswer = redisUtil.hGetString(studentAnswerKey, studentId.toString());
+                log.info("延迟检测任务执行，Redis答案: {}, 提交答案: {}, 是否相同: {}", latestAnswer, submittedAnswer, latestAnswer != null && latestAnswer.equals(submittedAnswer));
+
+                if (latestAnswer != null) {
+                    if (latestAnswer.equals(submittedAnswer)) {
+                        // 任务快照与Redis答案一致，说明十几秒未修改，可能是最终记录
+                        // 触发数据库入库
+                        Answer answerEntity = new Answer();
+                        answerEntity.setPlanId(planId);
+                        answerEntity.setQuestionId(questionId);
+                        answerEntity.setStudentId(studentId);
+                        answerEntity.setAnswer(latestAnswer);
+                        answerEntity.setCreateTime(LocalDateTime.now());
+                        answerEntity.setUpdateTime(LocalDateTime.now());
+
+                        // 将答案加入批量更新队列
+                        boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                        log.info("任务快照与Redis答案一致，加入批量队列结果: {}, planId: {}, questionId: {}, studentId: {}",
+                                offerResult, planId, questionId, studentId);
+                    } else {
+                        // 任务快照与Redis答案不一致，说明用户继续修改了答案
+                        // 新增task，使用Redis的最新作答作为新task的快照
+                        log.info("任务快照与Redis答案不一致，创建新任务，planId: {}, questionId: {}, studentId: {}",
+                                planId, questionId, studentId);
+                        
+                        // 创建新的延迟检测任务
+                        DelayCheckTask newTask = new DelayCheckTask(
+                                planId,
+                                questionId,
+                                studentId,
+                                latestAnswer, // 使用最新答案作为新任务的快照
+                                studentAnswerKey
+                        );
+                        // 将新任务放入延迟队列，而不是直接执行
+                        boolean offerResult = delayQueue.offer(newTask);
+                        log.info("创建新延迟检测任务并加入队列，结果: {}, planId: {}, questionId: {}, studentId: {}, 当前队列大小: {}",
+                                offerResult, planId, questionId, studentId, delayQueue.size());
+                    }
+                } else {
+                    // Redis中没有数据，说明数据已经丢失
+                    // 此时不应该重复入库，因为批量更新队列已经处理了这种情况
+                    log.info("Redis无数据，延迟任务不处理: planId: {}, questionId: {}, studentId: {}",
+                            planId, questionId, studentId);
+                }
+            } catch (Exception e) {
+                log.error("延迟检测任务执行失败", e);
+                // 异常时也将提交的数据加入队列
+                try {
+                    Answer answerEntity = new Answer();
+                    answerEntity.setPlanId(planId);
+                    answerEntity.setQuestionId(questionId);
+                    answerEntity.setStudentId(studentId);
+                    answerEntity.setAnswer(submittedAnswer);
+                    answerEntity.setCreateTime(LocalDateTime.now());
+                    answerEntity.setUpdateTime(LocalDateTime.now());
+
+                    boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                    log.info("异常时加入队列结果: {}, planId: {}, questionId: {}, studentId: {}",
+                            offerResult, planId, questionId, studentId);
+                } catch (Exception ex) {
+                    log.error("异常时加入队列失败", ex);
+                }
+            }
         }
     }
 
     @Override
     public void submitAnswer(AnswerDTO answerDTO) {
-        // 如果Redis不可用，直接调用数据库版本
-        if (redisUtil == null) {
-            submitAnswerByDB(answerDTO);
-            return;
-        }
-
+        long methodStartTime = System.currentTimeMillis();
+        Integer planId = answerDTO.getPlanId();
         Long questionId = answerDTO.getQuestionId();
         Long studentId = answerDTO.getStudentId();
-        String answer = answerDTO.getAnswer().toUpperCase();
-
-        // 构建Redis键
-        String studentAnswerKey = STUDENT_ANSWER_KEY_PREFIX + questionId + ":" + studentId;
-        String answerKey = ANSWER_KEY_PREFIX + questionId;
-        String statKey = ANSWER_STAT_KEY_PREFIX + questionId;
+        String newAnswer = answerDTO.getAnswer().toUpperCase().trim();
 
         try {
-            // 读取Lua脚本
-            String luaScript = loadLuaScript("check-answer-validity.lua");
-
-            // 执行Lua脚本进行原子操作
-            List<Long> result = redisUtil.executeLuaScriptForAnswerCheck(luaScript,
-                Arrays.asList(studentAnswerKey, answerKey, statKey),
-                studentId.toString(), answer, String.valueOf(24));
-
-            // 解析脚本返回结果
-            Long isFirstLong = result.get(0);
-            Long isValidLong = result.get(1);
-
-            boolean isFirst = isFirstLong == 1;
-            boolean isValid = isValidLong == 1;
-
-            // 如果答题有效，则触发异步更新数据库
-            if (isValid) {
+            if (redisUtil == null) {
+                // 如果Redis不可用，使用批量更新队列
+                long redisNullStartTime = System.currentTimeMillis();
                 Answer answerEntity = new Answer();
                 BeanUtils.copyProperties(answerDTO, answerEntity);
-                answerEntity.setAnswer(answer);
-                answerEntity.setIsFirst(isFirst);
+                answerEntity.setAnswer(newAnswer);
                 answerEntity.setCreateTime(LocalDateTime.now());
                 answerEntity.setUpdateTime(LocalDateTime.now());
+                boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                long redisNullEndTime = System.currentTimeMillis();
+                log.info("Redis不可用时加入批量队列结果: {}, 耗时: {}ms, planId: {}, questionId: {}, studentId: {}",
+                        offerResult, (redisNullEndTime - redisNullStartTime), planId, questionId, studentId);
+                return;
+            }
 
-                // 异步保存到数据库
-                saveAnswerToDbAsync(answerEntity);
+            // 判断并修改Redis里的作答记录（hash结构存储学生答题记录，key为student_answer:planId:questionId，field为studentId）
+            String studentAnswerKey = STUDENT_ANSWER_KEY_PREFIX + planId + ":" + questionId;
+
+            // 内嵌Lua脚本进行原子操作
+            String luaScript = "local key = KEYS[1]\n" +
+                              "local studentId = ARGV[1]\n" +
+                              "local newAnswer = ARGV[4]\n" +
+                              "\n" +
+                              "if redis.call('hexists', key, studentId) == 1 then\n" +
+                              "    local currentAnswer = redis.call('hget', key, studentId)\n" +
+                              "    if currentAnswer == newAnswer then\n" +
+                              "        return \"unchanged\"\n" +
+                              "    end\n" +
+                              "end\n" +
+                              "redis.call('hset', key, studentId, newAnswer)\n" +
+                              "redis.call('expire', key, 604800)\n" +
+                              "return newAnswer\n";
+
+            // 执行Lua脚本进行原子操作
+            long luaStartTime = System.currentTimeMillis();
+            String scriptResult = redisUtil.executeLuaScriptForStringResult(luaScript,
+                Arrays.asList(studentAnswerKey),
+                studentId.toString(), questionId.toString(), planId.toString(), newAnswer, String.valueOf(System.currentTimeMillis()));
+            long luaEndTime = System.currentTimeMillis();
+            log.info("执行Lua脚本完成，耗时: {}ms, 键: {}, 学生ID: {}, 答案: {}, 脚本返回结果: {}", 
+                    (luaEndTime - luaStartTime), studentAnswerKey, studentId, newAnswer, scriptResult);
+
+            // 根据脚本返回结果决定是否进行数据库操作
+            if (scriptResult != null && !scriptResult.equals("unchanged")) {
+                long delayTaskStartTime = System.currentTimeMillis();
+                // 验证Redis中当前答案
+                String redisCurrentAnswer = redisUtil.hGetString(studentAnswerKey, studentId.toString());
+                log.info("脚本执行结果: {}, 答案: {}, Redis中当前答案: {}", scriptResult, newAnswer, redisCurrentAnswer);
+                
+                // 确保Redis中确实有值才触发延迟任务
+                if (redisCurrentAnswer != null) {
+                    // 触发延迟检测任务，携带脚本返回的答案作为快照信息
+                    DelayCheckTask task = new DelayCheckTask(planId, questionId, studentId, scriptResult, studentAnswerKey);
+                    boolean offerResult = delayQueue.offer(task);
+                    long delayTaskEndTime = System.currentTimeMillis();
+                    log.info("提交触发延迟检测任务完成，耗时: {}ms, 结果: {}, planId: {}, questionId: {}, studentId: {}, 当前队列大小: {}",
+                            (delayTaskEndTime - delayTaskStartTime), offerResult, planId, questionId, studentId, delayQueue.size());
+                } else {
+                    // Redis中没有数据，说明数据已经丢失，直接降级到数据库操作
+                    log.warn("Redis中无数据，直接降级到数据库操作，planId: {}, questionId: {}, studentId: {}",
+                            planId, questionId, studentId);
+                    Answer answerEntity = new Answer();
+                    BeanUtils.copyProperties(answerDTO, answerEntity);
+                    answerEntity.setAnswer(newAnswer);
+                    answerEntity.setCreateTime(LocalDateTime.now());
+                    answerEntity.setUpdateTime(LocalDateTime.now());
+                    boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                    log.info("Redis无数据时加入批量队列结果: {}, planId: {}, questionId: {}, studentId: {}",
+                            offerResult, planId, questionId, studentId);
+                }
+            } else if (scriptResult == null) {
+                // 如果脚本执行失败，删除Redis记录并降级到数据库
+                log.warn("Lua脚本执行失败，降级到数据库操作");
+                long fallbackStartTime = System.currentTimeMillis();
+                try {
+                    redisUtil.delete(studentAnswerKey);
+                } catch (Exception ex) {
+                    log.error("删除Redis记录失败", ex);
+                }
+                // 降级到数据库操作
+                Answer answerEntity = new Answer();
+                BeanUtils.copyProperties(answerDTO, answerEntity);
+                answerEntity.setAnswer(newAnswer);
+                answerEntity.setCreateTime(LocalDateTime.now());
+                answerEntity.setUpdateTime(LocalDateTime.now());
+                boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                long fallbackEndTime = System.currentTimeMillis();
+                log.info("脚本执行失败时加入批量队列结果: {}, 耗时: {}ms, planId: {}, questionId: {}, studentId: {}",
+                        offerResult, (fallbackEndTime - fallbackStartTime), planId, questionId, studentId);
+            } else if (scriptResult.equals("unchanged")) {
+                long unchangedStartTime = System.currentTimeMillis();
+                String redisCurrentAnswer = redisUtil.hGetString(studentAnswerKey, studentId.toString());
+                long unchangedEndTime = System.currentTimeMillis();
+                log.info("答案未变化，不进行数据库操作，当前Redis答案: {}, 耗时: {}ms, planId: {}, questionId: {}, studentId: {}",
+                        redisCurrentAnswer, (unchangedEndTime - unchangedStartTime), planId, questionId, studentId);
+                // 答案未变化时，不触发延迟任务，避免重复入库
             }
         } catch (Exception e) {
-            System.err.println("Redis unavailable for submitAnswer, falling back to direct DB storage: " + e.getMessage());
-            // Redis不可用时，直接保存到数据库
-            Answer answerEntity = new Answer();
-            BeanUtils.copyProperties(answerDTO, answerEntity);
-            answerEntity.setAnswer(answer);
-            answerEntity.setIsFirst(true); // 默认设为首次答题
-            answerEntity.setCreateTime(LocalDateTime.now());
-            answerEntity.setUpdateTime(LocalDateTime.now());
-
-            // 异步保存到数据库
-            saveAnswerToDbAsync(answerEntity);
+            log.error("Redis操作失败，降级到数据库存储: {}", e.getMessage());
+            // Redis不可用时，直接加入批量更新队列
+            try {
+                long exceptionFallbackStartTime = System.currentTimeMillis();
+                Answer answerEntity = new Answer();
+                BeanUtils.copyProperties(answerDTO, answerEntity);
+                answerEntity.setAnswer(newAnswer);
+                answerEntity.setCreateTime(LocalDateTime.now());
+                answerEntity.setUpdateTime(LocalDateTime.now());
+                boolean offerResult = batchUpdateQueue.offer(answerEntity);
+                long exceptionFallbackEndTime = System.currentTimeMillis();
+                log.info("异常时加入批量队列结果: {}, 耗时: {}ms, planId: {}, questionId: {}, studentId: {}",
+                        offerResult, (exceptionFallbackEndTime - exceptionFallbackStartTime), planId, questionId, studentId);
+            } catch (Exception ex) {
+                log.error("异常时加入批量队列失败", ex);
+            }
+        } finally {
+            long methodEndTime = System.currentTimeMillis();
+            log.info("submitAnswer方法执行完成，总耗时: {}ms, planId: {}, questionId: {}, studentId: {}",
+                    (methodEndTime - methodStartTime), planId, questionId, studentId);
         }
     }
 
@@ -146,8 +480,7 @@ public class AnswerServiceImpl implements AnswerService {
             statistic.setPlanId(planId);
 
             // Redis键名包含planId
-            String answerKey = ANSWER_KEY_PREFIX + questionId + ":" + planId;
-            String statKey = ANSWER_STAT_KEY_PREFIX + questionId + ":" + planId;
+            String answerKey = STUDENT_ANSWER_KEY_PREFIX + planId + ":" + questionId;
 
             // 获取所有学生的答题记录
             var answers = redisUtil.hGetAll(answerKey);
@@ -173,8 +506,8 @@ public class AnswerServiceImpl implements AnswerService {
                 }
             }
 
-            // 假设总学生数为100（实际应用中应从数据库或Redis获取）
-            int totalStudents = 100;
+            // 假设总学生数为50（实际应用中应从数据库或Redis获取）
+            int totalStudents = 50;
             int notAnsweredCount = totalStudents - answeredCount;
 
             // 计算比例
@@ -276,6 +609,18 @@ public class AnswerServiceImpl implements AnswerService {
         }
     }
 
+
+    @Override
+    public void submitAnswerByDBMulti(AnswerDTO answerDTO) {
+        // 每次都插入一个新记录
+        Answer answerEntity = new Answer();
+        BeanUtils.copyProperties(answerDTO, answerEntity);
+        answerEntity.setIsFirst(true);
+        answerEntity.setCreateTime(LocalDateTime.now());
+        answerEntity.setUpdateTime(LocalDateTime.now());
+        answerMapper.insert(answerEntity);
+    }
+
     @Override
     public AnswerStatistic getAnswerStatisticByDB(Long questionId, Integer planId) {
         AnswerStatistic statistic = new AnswerStatistic();
@@ -290,11 +635,24 @@ public class AnswerServiceImpl implements AnswerService {
                         .eq(Answer::getPlanId, planId)
         );
 
+        // 按学生ID分组，只保留每个学生的最新作答记录
+        Map<Long, Answer> latestAnswersByStudent = new HashMap<>();
+        for (Answer answer : answers) {
+            Long studentId = answer.getStudentId();
+            Answer existingAnswer = latestAnswersByStudent.get(studentId);
+            if (existingAnswer == null || answer.getCreateTime().isAfter(existingAnswer.getCreateTime())) {
+                latestAnswersByStudent.put(studentId, answer);
+            }
+        }
+
+        // 使用最新的作答记录进行统计
+        List<Answer> latestAnswers = new ArrayList<>(latestAnswersByStudent.values());
+
         // 统计各选项数量
         int aCount = 0, bCount = 0, cCount = 0, dCount = 0;
         ObjectMapper objectMapper = new ObjectMapper();
 
-        for (Answer answer : answers) {
+        for (Answer answer : latestAnswers) {
             try {
                 // 解析JSON格式的答案
                 Map<String, String> answerMap = objectMapper.readValue(answer.getAnswer(), Map.class);
@@ -347,7 +705,7 @@ public class AnswerServiceImpl implements AnswerService {
 
         // 这里假设总学生数为80（与压测脚本一致）
         int totalStudents = 50;
-        int answeredCount = answers.size();
+        int answeredCount = latestAnswers.size();
         int notAnsweredCount = totalStudents - answeredCount;
 
         // 计算比例
@@ -367,4 +725,5 @@ public class AnswerServiceImpl implements AnswerService {
 
         return statistic;
     }
+
 }

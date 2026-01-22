@@ -5,7 +5,7 @@ import argparse
 import sys
 
 # 基础URL配置
-BASE_URL_SUBMIT = "/api/answer/submit-db"
+BASE_URL_SUBMIT = "/answer/submit-redis"
 
 # 配置参数
 QUESTION_COUNT = -1  # -1表示无限递增
@@ -29,9 +29,9 @@ def read_config():
             pass
     return config
 
-# 答案序列
-ANSWER_SEQUENCE = ['A', 'B', 'C', 'D']
-SUBMIT_COUNT = len(ANSWER_SEQUENCE)
+# 答案序列 - 只提交"A"
+ANSWER_SEQUENCE = ['A']
+SUBMIT_COUNT = 1
 STAT_QPS_PER_QUESTION = 5
 
 # 全局计数器
@@ -148,40 +148,28 @@ class StudentSubmitUser(FastHttpUser):
         if not question_id or not student_id:
             return
         
-        # 提交答案
-        for answer in ANSWER_SEQUENCE:
-            # 读取配置文件获取planId
-            config = read_config()
-            plan_id = config.get("test_plan_id", 100)  # 默认值为100
+        # 提交答案 - 每个questionid-student只提交一次"A"
+        # 读取配置文件获取planId
+        config = read_config()
+        plan_id = config.get("test_plan_id", 100)  # 默认值为100
+        
+        payload = {
+            "questionId": question_id,
+            "studentId": student_id,
+            "answer": "A",
+            "planId": plan_id
+        }
+        
+        with self.client.post(BASE_URL_SUBMIT, name="提交答案", json=payload, catch_response=True) as response:
+            # 获取响应时间
+            response_time = response.request_meta.get('response_time', 0)
+            # 添加到响应时间监控列表
+            global_counter.add_response_time(response_time)
             
-            payload = {
-                "questionId": question_id,
-                "studentId": student_id,
-                "answer": answer,
-                "planId": plan_id
-            }
-            
-            with self.client.post(BASE_URL_SUBMIT, name="提交答案", json=payload, catch_response=True) as response:
-                # 获取响应时间
-                response_time = response.request_meta.get('response_time', 0)
-                # 添加到响应时间监控列表
-                global_counter.add_response_time(response_time)
-                
-                if response.status_code == 200:
-                    try:
-                        result = response.json()
-                        if isinstance(result, dict) and 'code' in result and result.get('code') == 200:
-                            global_counter.submit_success_count += 1
-                            global_counter.submit_response_times.append(response_time)
-                            # 将题目ID添加到最近提交列表
-                            if question_id not in global_counter.recent_question_ids:
-                                global_counter.recent_question_ids.append(question_id)
-                                global_counter.save_recent_question_ids()  # 保存到文件
-                            response.success()
-                        else:
-                            global_counter.submit_failure_count += 1
-                            response.failure(f"ApiResponse code {result.get('code')}: {result.get('message', 'Unknown error')}")
-                    except (ValueError, KeyError):
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    if isinstance(result, dict) and 'code' in result and result.get('code') == 200:
                         global_counter.submit_success_count += 1
                         global_counter.submit_response_times.append(response_time)
                         # 将题目ID添加到最近提交列表
@@ -189,21 +177,32 @@ class StudentSubmitUser(FastHttpUser):
                             global_counter.recent_question_ids.append(question_id)
                             global_counter.save_recent_question_ids()  # 保存到文件
                         response.success()
-                else:
-                    global_counter.submit_failure_count += 1
-                    response.failure(f"Status {response.status_code}")
+                    else:
+                        global_counter.submit_failure_count += 1
+                        response.failure(f"ApiResponse code {result.get('code')}: {result.get('message', 'Unknown error')}")
+                except (ValueError, KeyError):
+                    global_counter.submit_success_count += 1
+                    global_counter.submit_response_times.append(response_time)
+                    # 将题目ID添加到最近提交列表
+                    if question_id not in global_counter.recent_question_ids:
+                        global_counter.recent_question_ids.append(question_id)
+                        global_counter.save_recent_question_ids()  # 保存到文件
+                    response.success()
+            else:
+                global_counter.submit_failure_count += 1
+                response.failure(f"Status {response.status_code}")
         
         # 暂时禁用错误率检测
         # self.check_error_rate()
     
     def get_next_submit_task(self):
         """
-        生成提交任务，题目ID无限递增
+        生成提交任务，题目ID和学生ID都从1开始无上限递增
         """
         self.task_counter += 1
         global_counter.task_counter += 1
-        question_id = self.task_counter + 100  # 题目ID从101开始，无限递增
-        student_id = ((self.task_counter - 1) % STUDENT_COUNT) + 100  # 学生ID从100开始，循环使用
+        question_id = self.task_counter  # 题目ID从1开始，无限递增
+        student_id = self.task_counter  # 学生ID从1开始，无限递增
         return question_id, student_id
     
     def check_error_rate(self):
